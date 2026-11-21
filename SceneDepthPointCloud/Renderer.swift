@@ -13,12 +13,9 @@ import UIKit
 
 final class Renderer {
     // Whether recording is on
-    public var isRecording = false;
-    // Current folder for saving data
+    public var isRecording = false
+    // Current folder for saving the point cloud
     public var currentFolder = ""
-    // Pick every n frames (~1/sampling frequency)
-    public var pickFrames = 5 // default to save 1/5 of the new frames
-    public var currentFrameIndex = 0;
     // Task delegate for informing ViewController of tasks
     public weak var delegate: TaskDelegate?
     
@@ -206,26 +203,6 @@ final class Renderer {
         
         if shouldAccumulate(frame: currentFrame), updateDepthTextures(frame: currentFrame) {
             accumulatePoints(frame: currentFrame, commandBuffer: commandBuffer, renderEncoder: renderEncoder)
-            
-            if (checkSamplingRate()) {
-                // save selected data to disk if not dropped
-                autoreleasepool {
-                    // selected data are deep copied into custom struct to release currentFrame
-                    // if not, the pools of memory reserved for ARFrame will be full and later frames will be dropped
-                    let data = ARFrameDataPack(
-                        timestamp: currentFrame.timestamp,
-                        cameraTransform: currentFrame.camera.transform,
-                        cameraEulerAngles: currentFrame.camera.eulerAngles,
-                        depthMap: duplicatePixelBuffer(input: currentFrame.sceneDepth!.depthMap),
-                        smoothedDepthMap: duplicatePixelBuffer(input: currentFrame.smoothedSceneDepth!.depthMap),
-                        confidenceMap: duplicatePixelBuffer(input: currentFrame.sceneDepth!.confidenceMap!),
-                        capturedImage: duplicatePixelBuffer(input: currentFrame.capturedImage),
-                        localToWorld: pointCloudUniforms.localToWorld,
-                        cameraIntrinsicsInversed: pointCloudUniforms.cameraIntrinsicsInversed
-                    )
-                    saveData(frame: data)
-                }
-            }
         }
         
         // check and render rgb camera image
@@ -257,87 +234,38 @@ final class Renderer {
         commandBuffer.commit()
     }
     
-    // custom struct for pulling necessary data from arframes
-    struct ARFrameDataPack {
-        var timestamp: Double
-        var cameraTransform: simd_float4x4
-        var cameraEulerAngles: simd_float3
-        var depthMap: CVPixelBuffer
-        var smoothedDepthMap: CVPixelBuffer
-        var confidenceMap: CVPixelBuffer
-        var capturedImage: CVPixelBuffer
-        var localToWorld: simd_float4x4
-        var cameraIntrinsicsInversed: simd_float3x3
-    }
-    
-    /// Save data to disk in json and jpeg formats.
-    private func saveData(frame: ARFrameDataPack) {
-        struct DataPack: Codable {
-            var timestamp: Double
-            var cameraTransform: simd_float4x4 // The position and orientation of the camera in world coordinate space.
-            var cameraEulerAngles: simd_float3 // The orientation of the camera, expressed as roll, pitch, and yaw values.
-            var depthMap: [[Float32]]
-            var smoothedDepthMap: [[Float32]]
-            var confidenceMap: [[UInt8]]
-            var localToWorld: simd_float4x4
-            var cameraIntrinsicsInversed: simd_float3x3
-        }
-        
-        delegate?.didStartTask()
-        Task.init(priority: .utility) {
-            do {
-                let dataPack = await DataPack(
-                    timestamp: frame.timestamp,
-                    cameraTransform: frame.cameraTransform,
-                    cameraEulerAngles: frame.cameraEulerAngles,
-                    depthMap: cvPixelBuffer2Map(rawDepth: frame.depthMap),
-                    smoothedDepthMap: cvPixelBuffer2Map(rawDepth: frame.smoothedDepthMap),
-                    confidenceMap: cvPixelBuffer2Map(rawDepth: frame.confidenceMap),
-                    localToWorld: frame.localToWorld,
-                    cameraIntrinsicsInversed: frame.cameraIntrinsicsInversed
-                )
-                
-                let jsonEncoder = JSONEncoder()
-                jsonEncoder.outputFormatting = .prettyPrinted
-                
-                let encoded = try jsonEncoder.encode(dataPack)
-                let encodedStr = String(data: encoded, encoding: .utf8)!
-                try await saveFile(content: encodedStr, filename: "\(frame.timestamp)_\(pickFrames).json", folder: currentFolder + "/data")
-                try await savePic(pic: cvPixelBuffer2UIImage(pixelBuffer: frame.capturedImage), filename: "\(frame.timestamp)_\(pickFrames).jpeg", folder: currentFolder + "/data")
-                delegate?.didFinishTask()
-            } catch {
-                print(error.localizedDescription)
-            }
-        }
-    }
-    
-    /// Save all particles to a point cloud file in ply format.
+    /// Save the accumulated LiDAR points as geometry-only files (meters).
     func savePointCloud() {
         delegate?.didStartTask()
-        Task.init(priority: .utility) {
+        Task(priority: .utility) {
             do {
-                var fileToWrite = ""
-                let headers = ["ply", "format ascii 1.0", "element vertex \(currentPointCount)", "property float x", "property float y", "property float z", "property uchar red", "property uchar green", "property uchar blue", "element face 0", "property list uchar int vertex_indices", "end_header"]
-                for header in headers {
-                    fileToWrite += header
-                    fileToWrite += "\r\n"
-                }
-                
+                var rows: [(SIMD3<Float>, Float)] = []
+                rows.reserveCapacity(currentPointCount)
                 for i in 0..<currentPointCount {
                     let point = particlesBuffer[i]
-                    let colors = point.color
-                    
-                    let red = colors.x * 255.0
-                    let green = colors.y * 255.0
-                    let blue = colors.z * 255.0
-                    
-                    let pvValue = "\(point.position.x) \(point.position.y) \(point.position.z) \(Int(red)) \(Int(green)) \(Int(blue))"
-                    fileToWrite += pvValue
-                    fileToWrite += "\r\n"
+                    if point.confidence < Float(confidenceThreshold) { continue }
+                    rows.append((point.position, point.confidence))
                 }
-                
-                try await saveFile(content: fileToWrite, filename: "\(getTimeStr()).ply", folder: currentFolder)
-                
+
+                let stamp = getTimeStr()
+                let count = rows.count
+
+                var ply = "ply\nformat ascii 1.0\nelement vertex \(count)\n"
+                ply += "property float x\nproperty float y\nproperty float z\nproperty float confidence\nend_header\n"
+                var csv = "x,y,z,confidence\n"
+                var xyz = ""
+
+                for (position, confidence) in rows {
+                    let line = "\(position.x) \(position.y) \(position.z) \(confidence)\n"
+                    ply += line
+                    xyz += line
+                    csv += "\(position.x),\(position.y),\(position.z),\(confidence)\n"
+                }
+
+                try await saveFile(content: ply, filename: "\(stamp).ply", folder: currentFolder)
+                try await saveFile(content: xyz, filename: "\(stamp).txt", folder: currentFolder)
+                try await saveFile(content: xyz, filename: "\(stamp).xyz", folder: currentFolder)
+                try await saveFile(content: csv, filename: "\(stamp).csv", folder: currentFolder)
                 delegate?.didFinishTask()
             } catch {
                 print(error.localizedDescription)
@@ -353,12 +281,6 @@ final class Renderer {
         return currentPointCount == 0
         || dot(cameraTransform.columns.2, lastCameraTransform.columns.2) <= cameraRotationThreshold
         || distance_squared(cameraTransform.columns.3, lastCameraTransform.columns.3) >= cameraTranslationThreshold
-    }
-    
-    /// Check if the current frame should be saved or dropped based on sampling rate configuration
-    private func checkSamplingRate() -> Bool {
-        currentFrameIndex += 1
-        return currentFrameIndex % pickFrames == 0
     }
     
     private func accumulatePoints(frame: ARFrame, commandBuffer: MTLCommandBuffer, renderEncoder: MTLRenderCommandEncoder) {
